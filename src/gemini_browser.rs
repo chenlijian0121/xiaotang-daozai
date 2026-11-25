@@ -4,7 +4,11 @@ use serde_json::{json,Value};
 use std::{fs,io::ErrorKind,net::{Ipv4Addr,SocketAddr,TcpStream},sync::atomic::{AtomicBool,Ordering},time::{Duration,Instant}};
 use tungstenite::{client::client_with_config,handshake::HandshakeError,protocol::WebSocketConfig,Error,Message,WebSocket};
 
-const ERROR:&str="Chrome 授权未完成或连接已断开，请重新连接";
+#[path="gemini_doubao_browser.rs"]
+mod doubao;
+pub(super) use doubao::DoubaoConnection;
+
+const ERROR:&str="浏览器授权未完成或连接已断开，请重新连接";
 const CANCEL:&str="已取消 Gemini 连接";
 const MAX:usize=1024*1024;
 const EMAIL_SCRIPT:&str=r#"(()=>{if(location.origin!=='https://gemini.google.com'||!/^\/(?:u\/\d+\/)?usage\/?$/.test(location.pathname))return '';const a=document.querySelector('a[href^="https://accounts.google.com/SignOutOptions"][aria-label]')||document.querySelector('a[aria-label*="@"]');return(a?.getAttribute('aria-label')||'').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0]||''})()"#;
@@ -25,7 +29,7 @@ fn check(cancel:&AtomicBool,deadline:Instant,timeout:&str)->Result<(),String>{
 struct Socket {socket:WebSocket<TcpStream>,next:u32}
 impl Socket {
     fn open(endpoint:&Endpoint,cancel:&AtomicBool,timeout:Duration)->Result<Self,String>{
-        let deadline=Instant::now()+timeout;check(cancel,deadline,"等待 Chrome 授权超时，请重新连接")?;
+        let deadline=Instant::now()+timeout;check(cancel,deadline,"等待浏览器授权超时，请重新连接")?;
         let stream=TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST,endpoint.port)),Duration::from_secs(2)).map_err(|_|ERROR)?;
         stream.set_nonblocking(true).map_err(|_|ERROR)?;
         let config=WebSocketConfig::default().max_message_size(Some(MAX)).max_frame_size(Some(MAX));
@@ -34,7 +38,7 @@ impl Socket {
             Ok((socket,_))=>return Ok(Self{socket,next:0}),
             Err(HandshakeError::Failure(_))=>return Err(ERROR.into()),
             Err(HandshakeError::Interrupted(pending))=>{
-                check(cancel,deadline,"等待 Chrome 授权超时，请重新连接")?;
+                check(cancel,deadline,"等待浏览器授权超时，请重新连接")?;
                 std::thread::sleep(Duration::from_millis(20));handshake=pending.handshake();
             }
         }}

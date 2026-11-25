@@ -70,7 +70,7 @@ impl State {
     }
     pub fn receive(&mut self,mut event:quota::Event){
         self.busy.remove(&event.id);
-        if !self.config.accounts.iter().any(|a|a.id==event.id && a.enabled){return;}
+        let Some(provider)=self.config.accounts.iter().find(|a|a.id==event.id && a.enabled).map(|a|a.provider) else{return;};
         if let Some(account)=self.config.accounts.iter().find(|a|a.id==event.id&&a.provider==Provider::Kiro).cloned(){
             if let Ok(snapshot)=&event.result{
                 let verified=(||{
@@ -86,17 +86,19 @@ impl State {
                 if let Err(error)=verified{event.result=Err(error);}
             }
         }
+        let had_snapshot = matches!(self.rows.get(&event.id), Some(Ok(_)));
         if let Err(error)=&event.result{
-            if matches!(self.rows.get(&event.id),Some(Ok(_))){
+            // agy 跟随 CLI 当前账号，新的记录无效时不能继续展示旧账号的比例。
+            if had_snapshot && provider != Provider::Antigravity {
                 self.stale.insert(event.id,error.clone());return;
             }
         }
         let success=event.result.is_ok();
-        let old_local_record=self.config.accounts.iter().any(|a|a.id==event.id&&a.provider==Provider::Claude)&&event.result.as_ref().is_ok_and(|s|chrono::Utc::now().timestamp()-s.at>1800);
+        let old_local_record=provider==Provider::Claude&&event.result.as_ref().is_ok_and(|s|chrono::Utc::now().timestamp()-s.at>1800);
         self.stale.remove(&event.id);
         if old_local_record{self.stale.insert(event.id.clone(),"本地记录较旧，等待 Claude 更新".into());}
         self.rows.insert(event.id,event.result);
-        if success{self.save_snapshots();}
+        if success || (provider == Provider::Antigravity && had_snapshot){self.save_snapshots();}
     }
 }
 fn accent_color(accent:Accent,provider:Provider)->Color32{
@@ -146,7 +148,10 @@ fn logo_texture(ctx:&egui::Context,provider:Provider,pixels:u32)->Option<egui::T
         let bitmap=image::load_from_memory(include_bytes!("../assets/ai-icons/doubao.png")).ok()?.resize_exact(pixels,pixels,image::imageops::FilterType::Lanczos3).to_rgba8();
         egui::ColorImage::from_rgba_unmultiplied([pixels as usize,pixels as usize],bitmap.as_raw())
     }else{
-        let bytes:&[u8]=match provider{Provider::ZCode=>include_bytes!("../assets/ai-icons/zcode.svg"),Provider::Codex=>include_bytes!("../assets/ai-icons/codex.svg"),Provider::Claude=>include_bytes!("../assets/ai-icons/claude.svg"),Provider::Kimi=>include_bytes!("../assets/ai-icons/kimi.svg"),Provider::GrokBot=>include_bytes!("../assets/ai-icons/grokbot.svg"),Provider::Gemini=>include_bytes!("../assets/ai-icons/gemini.svg"),Provider::WorkBuddy=>include_bytes!("../assets/ai-icons/workbuddy.svg"),Provider::DeepSeek=>include_bytes!("../assets/ai-icons/deepseek.svg"),Provider::Kiro=>include_bytes!("../assets/ai-icons/kiro.svg"),Provider::OpenCodeGo=>include_bytes!("../assets/ai-icons/opencode.svg"),Provider::MiniMax=>include_bytes!("../assets/ai-icons/minimax.svg"),Provider::Glm=>include_bytes!("../assets/ai-icons/glm.svg"),_=>include_bytes!("../assets/ai-icons/api-key.svg")};
+        let bytes:&[u8]=match provider{
+            // 本机 CLI 用单色首字母标识，沿用额度环按屏幕像素生成纹理的方式。
+            Provider::Antigravity => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 20L12 4L20 20M7 14H17" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>"#,
+            Provider::ZCode=>include_bytes!("../assets/ai-icons/zcode.svg"),Provider::Codex=>include_bytes!("../assets/ai-icons/codex.svg"),Provider::Claude=>include_bytes!("../assets/ai-icons/claude.svg"),Provider::Kimi=>include_bytes!("../assets/ai-icons/kimi.svg"),Provider::GrokBot=>include_bytes!("../assets/ai-icons/grokbot.svg"),Provider::Gemini=>include_bytes!("../assets/ai-icons/gemini.svg"),Provider::WorkBuddy=>include_bytes!("../assets/ai-icons/workbuddy.svg"),Provider::DeepSeek=>include_bytes!("../assets/ai-icons/deepseek.svg"),Provider::Kiro=>include_bytes!("../assets/ai-icons/kiro.svg"),Provider::OpenCodeGo=>include_bytes!("../assets/ai-icons/opencode.svg"),Provider::MiniMax=>include_bytes!("../assets/ai-icons/minimax.svg"),Provider::Glm=>include_bytes!("../assets/ai-icons/glm.svg"),_=>include_bytes!("../assets/ai-icons/api-key.svg")};
         egui_extras::image::load_svg_bytes_with_size(bytes,Some(egui::load::SizeHint::Size(pixels,pixels))).ok()?
     };
     // 白色标识使用矢量覆盖率，避免透明边缘再次变暗。
@@ -231,6 +236,13 @@ fn connection_group(provider:Provider)->Provider{
 fn connection_name(provider:Provider)->&'static str{
     match connection_group(provider){Provider::ZCode=>"GLM / ZCode",Provider::NewApi=>"中转站",other=>other.name()}
 }
+/// 用户点击打开按钮后启动交互终端，消息用于连接窗或账号详情中的状态反馈。
+fn open_agy_message() -> String {
+    match quota::open_antigravity_cli() {
+        Ok(()) => "已打开 agy".into(),
+        Err(error) => error,
+    }
+}
 fn kiro_details(snapshot:&Snapshot)->String{
     let Some(details)=&snapshot.kiro else{return String::new();};
     let mut lines=details.pools.iter().map(|p|{
@@ -313,11 +325,26 @@ impl App {
         if let Some(result)=result{
             self.quota.gemini_connecting=None;
             if self.settings_open&&self.quota.connect_open{
-                match result.and_then(|v|v.finish()){Ok(connected)=>{
-                    let previous=self.quota.config.clone();let id=self.quota.config.connect_gemini(connected.slot,connected.label);
-                    if let Err(error)=self.quota.config.save_checked(){self.quota.config=previous;self.quota.note=error;}
-                    else{self.quota.rows.insert(id.clone(),Ok(connected.snapshot));self.quota.stale.remove(&id);self.quota.save_snapshots();self.quota.connect_target=None;self.quota.gemini_cookie.clear();self.quota.note="Gemini 已连接".into();self.pending.push(Cmd::QuotaConnected);}
-                },Err(error)=>self.quota.note=error}
+                let saved=result.and_then(|connected|{
+                    // 账号配置写入成功后再接管浏览器连接；保存失败时让新连接随结果一起释放。
+                    let mut candidate=self.quota.config.clone();
+                    let id=candidate.connect_gemini(connected.slot.clone(),connected.label.clone());
+                    candidate.save_checked()?;
+                    let connected=connected.finish().map_err(|error|{
+                        match self.quota.config.save_checked(){
+                            Ok(())=>error,
+                            Err(restore)=>format!("{error}；恢复原账号配置失败：{restore}"),
+                        }
+                    })?;
+                    self.quota.config=candidate;
+                    Ok((id,connected.snapshot))
+                });
+                match saved{
+                    Ok((id,snapshot))=>{
+                        self.quota.rows.insert(id.clone(),Ok(snapshot));self.quota.stale.remove(&id);self.quota.save_snapshots();self.quota.connect_target=None;self.quota.gemini_cookie.clear();self.quota.note="Gemini 已连接".into();self.pending.push(Cmd::QuotaConnected);
+                    },
+                    Err(error)=>self.quota.note=error,
+                }
             }
         }
         if let Some(result)=self.quota.doubao_connecting.as_ref().and_then(|connect|connect.poll()){
@@ -350,7 +377,15 @@ impl App {
         self.quota.note.clear();self.quota.kiro_connecting=Some(quota::kiro::Connect::start(path,self.quota.alias.clone(),target));
     }
     pub fn quota_config(&self)->&Config{&self.quota.config}
-    pub fn quota_initialize(&mut self){if !crate::model::config_dir().join("ai-quota.json").exists(){self.quota.config.discover();self.quota.config.save();}}
+    pub fn quota_initialize(&mut self){
+        if !crate::model::config_dir().join("ai-quota.json").exists(){self.quota.config.discover();self.quota.config.save();}
+        // 只有显式要求连接的启动才安装状态栏回调，普通启动尊重用户移除卡片的选择。
+        if std::env::args_os().any(|arg| arg == "--connect-antigravity") {
+            if let Err(error) = self.quota.config.connect_antigravity("") {
+                self.quota.note = error;
+            }
+        }
+    }
     pub fn quota_pending(&mut self,accounts:&[Account]){self.quota.busy.extend(accounts.iter().map(|a|a.id.clone()));}
     pub fn quota_event(&mut self,event:quota::Event){self.quota.receive(event);}
     pub fn quota_set_source(&mut self,path:std::path::PathBuf){self.quota.source=path.to_string_lossy().into_owned();}
@@ -427,13 +462,17 @@ impl App {
             if let Some(at)=chrono::DateTime::from_timestamp(s.at,0){
                 let at=at.with_timezone(&chrono::Local);let time=at.format(if at.date_naive()==chrono::Local::now().date_naive(){"%H:%M"}else{"%m/%d %H:%M"}).to_string();
                 let busy=self.quota.busy.contains(&a.id);let stale=self.quota.stale.get(&a.id);
-                let status=if busy{format!("{} · {time}",if a.provider==Provider::Claude{"读取中…"}else{"正在更新…"})}
+                // 本机刷新只能重读最后一份上报，保留 agy 生成记录的时间。
+                let status=if a.provider==Provider::Antigravity{format!("agy 上次记录 · {time}")}
+                    else if busy{format!("{} · {time}",if a.provider==Provider::Claude{"读取中…"}else{"正在更新…"})}
                     else if stale.is_some(){format!("上次记录 · {time}")}
                     else if a.provider==Provider::Claude{format!("本地记录 · {time}")}
                     else if let Some(wallet)=&s.wallet{let b=wallet.primary();if wallet.balances.len()>1{let other=wallet.balances.iter().find(|other|other.currency!=b.currency).unwrap();format!("另有 {} {} · {time}",other.currency,other.full(other.total))}else{format!("{} · {time} 更新",b.currency)}}
                     else{format!("{time} 更新")};
                 let x=if a.provider.balance(){125.0}else{157.0};let width=357.0-x;let y=154.0;
-                c.centered_text(x,y,&c.fit(&status,10.0,W::Regular,width),10.0,W::Regular,if stale.is_some()&&!busy{Color32::from_rgb(255,166,77)}else{theme::DIM},H::Left);
+                // 带 agy 字母下伸部的状态行稍小，给上方周期和下方分页点各留出间距。
+                let status_size = if a.provider == Provider::Antigravity { 9.0 } else { 10.0 };
+                c.centered_text(x,y,&c.fit(&status,status_size,W::Regular,width),status_size,W::Regular,if stale.is_some()&&!busy{Color32::from_rgb(255,166,77)}else{theme::DIM},H::Left);
                 c.hit(x,y-6.0,width,8.0,("quota-update-time",&a.id)).on_hover_text(if let Some(reason)=stale{format!("{status}\n{reason}")}else{status});
             }
         }
@@ -545,7 +584,16 @@ impl App {
                     c.centered_text(355.0,y+4.0,&w.value_text(),if w.amount.is_some(){13.0}else{22.0},W::Semibold,theme::WHITE,H::Right);
                 }
             }
-        }else{let message=if self.quota.busy.contains(&a.id){"正在更新额度…"}else{result.and_then(|r|r.as_ref().err()).map(String::as_str).unwrap_or("等待更新额度")};for(i,line)in c.wrap(message,11.0,W::Regular,197.0,2).iter().enumerate(){c.text(157.0,103.0+i as f32*17.0,line,11.0,W::Regular,theme::GRAY,H::Left);}}
+        }else{
+            let message = if a.provider == Provider::Antigravity {
+                result.and_then(|r| r.as_ref().err()).map(String::as_str).unwrap_or("等待 agy 上报，请在 agy 中打开 /usage")
+            } else if self.quota.busy.contains(&a.id) {
+                "正在更新额度…"
+            } else {
+                result.and_then(|r| r.as_ref().err()).map(String::as_str).unwrap_or("等待更新额度")
+            };
+            for(i,line)in c.wrap(message,11.0,W::Regular,197.0,2).iter().enumerate(){c.text(157.0,103.0+i as f32*17.0,line,11.0,W::Regular,theme::GRAY,H::Left);}
+        }
     }
     fn quota_open_connection(&mut self,id:Option<String>){
         if self.quota.kiro_connecting.is_some()||self.quota.api_connecting.is_some()||self.quota.workbuddy_connecting.is_some()||self.quota.deepseek_connecting.is_some()||self.quota.gemini_connecting.is_some()||self.quota.doubao_connecting.is_some()||self.quota.login.is_some(){self.quota.connect_open=true;return;}
@@ -564,15 +612,32 @@ impl App {
         self.quota.connect_target=id;self.quota.connect_open=true;
     }
     fn quota_remove_account(&mut self,id:&str){
-        if let Some(a)=self.quota.config.accounts.iter().find(|a|a.id==id&&(a.provider.api_key()||a.provider==Provider::Doubao)).cloned(){
+        // 先保存账号列表，再释放浏览器连接或 CLI 状态栏回调。
+        if let Some(a)=self.quota.config.accounts.iter().find(|a|a.id==id&&(a.provider.api_key()||matches!(a.provider,Provider::Doubao|Provider::Gemini|Provider::Antigravity))).cloned(){
             if a.provider.api_key(){if let Some(slot)=&a.slot{if let Err(error)=quota::api::queue_cleanup(slot){self.quota.note=error;return;}}}
             let mut candidate=self.quota.config.clone();candidate.accounts.retain(|a|a.id!=id);candidate.colors.remove(id);
             if candidate.selected==id{candidate.selected=candidate.accounts.iter().find(|a|a.enabled).map(|a|a.id.clone()).unwrap_or_default();}
             if let Err(error)=candidate.save_checked(){self.quota.note=error;return;}
+            // 最后一张 agy 卡片负责释放本机回调；卸载失败时恢复原配置以便重试。
+            if a.provider == Provider::Antigravity && !candidate.accounts.iter().any(|other| other.provider == Provider::Antigravity) {
+                if let Err(error) = quota::disconnect_antigravity() {
+                    self.quota.note = match self.quota.config.save_checked() {
+                        Ok(()) => error,
+                        Err(restore) => format!("{error}；恢复账号配置失败：{restore}"),
+                    };
+                    return;
+                }
+            }
             self.quota.config=candidate;self.quota.rows.remove(id);self.quota.stale.remove(id);self.quota.busy.remove(id);self.quota.save_snapshots();
-            self.quota.note=match if a.provider==Provider::Doubao{quota::doubao::forget(&a)}else{quota::api::cleanup_pending(&self.quota.config)}{Ok(())=>"账号已移除".into(),Err(error)=>error};return;
+            let cleanup=match a.provider{
+                Provider::Doubao=>quota::doubao::forget(&a),
+                Provider::Gemini=>{quota::gemini::forget(&a);Ok(())},
+                Provider::Antigravity=>Ok(()),
+                _=>quota::api::cleanup_pending(&self.quota.config),
+            };
+            self.quota.note=match cleanup{Ok(())=>"账号已移除".into(),Err(error)=>error};return;
         }
-        if let Some(a)=self.quota.config.accounts.iter().find(|a|a.id==id){match a.provider{Provider::GrokBot=>quota::grok::forget(a),Provider::Gemini=>quota::gemini::forget(a),Provider::DeepSeek=>quota::deepseek::forget(a),Provider::WorkBuddy=>quota::workbuddy::forget(a),_=>{}}}
+        if let Some(a)=self.quota.config.accounts.iter().find(|a|a.id==id){match a.provider{Provider::GrokBot=>quota::grok::forget(a),Provider::DeepSeek=>quota::deepseek::forget(a),Provider::WorkBuddy=>quota::workbuddy::forget(a),_=>{}}}
         self.quota.config.accounts.retain(|a|a.id!=id);self.quota.config.colors.remove(id);self.quota.rows.remove(id);self.quota.stale.remove(id);self.quota.busy.remove(id);self.quota.save_snapshots();
         if self.quota.config.selected==id{self.quota.config.selected=self.quota.config.accounts.first().map(|a|a.id.clone()).unwrap_or_default();}
     }
@@ -607,7 +672,7 @@ impl App {
                             if !a.enabled{ui.label(egui::RichText::new("已暂停").size(11.5).color(ui.visuals().weak_text_color()));}
                             else if error.is_some(){ui.label(egui::RichText::new("需要处理").size(11.5).color(warn));}
                             else if let Some(s)=snapshot{ui.label(egui::RichText::new(quota_summary(s)).size(11.5));}
-                            else{ui.label(egui::RichText::new(if self.quota.busy.contains(&a.id){"正在查询…"}else{"等待更新"}).size(11.5).color(ui.visuals().weak_text_color()));}
+                            else{ui.label(egui::RichText::new(if a.provider==Provider::Antigravity{"等待 agy 上报"}else if self.quota.busy.contains(&a.id){"正在查询…"}else{"等待更新"}).size(11.5).color(ui.visuals().weak_text_color()));}
                         });
                     });
                     ui.ctx().data_mut(|d|d.insert_temp(open_id,open));
@@ -643,12 +708,15 @@ impl App {
                     }
                     if !a.enabled{ui.label(egui::RichText::new("已暂停监控").size(11.0).color(ui.visuals().weak_text_color()));}
                     else if let Some(error)=error{ui.add(egui::Label::new(egui::RichText::new(error).size(11.0).color(crate::settings_theme::color(ui.ctx(),Color32::from_rgb(231,175,108),Color32::from_rgb(151,94,28)))).wrap());}
-                    else if snapshot.is_none(){ui.label(egui::RichText::new(if self.quota.busy.contains(&a.id){"正在查询额度…"}else{"等待更新"}).size(11.0).color(ui.visuals().weak_text_color()));}
+                    else if snapshot.is_none(){ui.label(egui::RichText::new(if a.provider==Provider::Antigravity{"等待 agy 上报，请在 agy 中打开 /usage"}else if self.quota.busy.contains(&a.id){"正在查询额度…"}else{"等待更新"}).size(11.0).color(ui.visuals().weak_text_color()));}
                     ui.horizontal_wrapped(|ui|{
                         ui.checkbox(&mut a.enabled,"监控");ui.checkbox(&mut a.pinned,"常驻岛上");
                         if ui.add_enabled(!self.quota.busy.contains(&a.id),egui::Button::new(if error.is_some(){"重试"}else{"刷新"})).clicked(){self.pending.push(Cmd::QuotaRefresh);}
                         if ui.button("重新连接").clicked(){connect=Some(a.id.clone());}
-                        if let Some(s)=snapshot{let time=chrono::DateTime::from_timestamp(s.at,0).map(|at|at.with_timezone(&chrono::Local).format(if a.provider==Provider::Claude{"%m-%d %H:%M 本地记录"}else{"%H:%M 更新"}).to_string()).unwrap_or_default();ui.label(egui::RichText::new(time).size(10.0).color(ui.visuals().weak_text_color()));}
+                        if a.provider == Provider::Antigravity && ui.button("打开 agy").clicked() {
+                            self.quota.note = open_agy_message();
+                        }
+                        if let Some(s)=snapshot{let time=chrono::DateTime::from_timestamp(s.at,0).map(|at|at.with_timezone(&chrono::Local).format(match a.provider{Provider::Antigravity=>"agy 上次记录 · %m-%d %H:%M",Provider::Claude=>"%m-%d %H:%M 本地记录",_=>"%H:%M 更新"}).to_string()).unwrap_or_default();ui.label(egui::RichText::new(time).size(10.0).color(ui.visuals().weak_text_color()));}
                     });
                     if !a.provider.balance(){
                         let mut color=self.quota.config.colors.get(&a.id).copied().unwrap_or_default();color_picker(ui,a.provider,&mut color);
@@ -778,20 +846,46 @@ impl App {
                 ui.add_sized([ui.available_width(),27.0],egui::TextEdit::singleline(&mut self.quota.deepseek_key).password(true).hint_text("粘贴 API Key"));
                 if ui.add_enabled(self.quota.deepseek_connecting.is_none()&&!self.quota.deepseek_key.trim().is_empty(),egui::Button::new("验证并连接")).clicked(){self.quota.note.clear();self.quota.deepseek_connecting=Some(quota::deepseek::Connect::start(self.quota.alias.clone(),std::mem::take(&mut self.quota.deepseek_key)));}
                 if self.quota.deepseek_connecting.is_some(){ui.spinner();ui.label("正在连接 DeepSeek…");ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));}
+            }else if self.quota.provider==Provider::Antigravity{
+                ui.label("通过 Antigravity CLI 状态栏同步 Gemini 模型组的 5 小时和每周剩余额度。");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("启用额度同步").clicked() {
+                        // 安装回调并保存账号成功后，后台才开始读取本地记录。
+                        self.quota.note = match self.quota.config.connect_antigravity(&self.quota.alias) {
+                            Ok(()) => {
+                                self.pending.push(Cmd::QuotaConnected);
+                                "同步已启用，使用 agy 后更新".into()
+                            }
+                            Err(error) => error,
+                        };
+                    }
+                    if ui.button("打开 agy").clicked() {
+                        self.quota.note = open_agy_message();
+                    }
+                });
+                ui.label("启用后打开 agy，在终端输入 /usage 可刷新额度。");
             }else if self.quota.provider==Provider::Gemini{
                 ui.label(egui::RichText::new("读取 Gemini 网页的 5 小时与每周额度。").size(12.0).color(crate::settings_theme::color(ui.ctx(),Color32::from_gray(180),Color32::from_gray(75))));
+                // 重连时校验原账号；由用户选择浏览器，避免两个浏览器同时开启时连错账号。
+                let expected=self.quota.connect_target.as_ref().and_then(|id|self.quota.config.accounts.iter().find(|a|&a.id==id)).and_then(|a|a.slot.clone());
                 ui.horizontal_wrapped(|ui|{
                     if ui.button("打开默认浏览器登录").clicked(){self.pending.push(Cmd::OpenUrl("https://gemini.google.com/usage".into()));}
-                    if ui.add_enabled(self.quota.gemini_connecting.is_none(),egui::Button::new("连接已登录的 Chrome")).clicked(){self.quota.note.clear();self.quota.gemini_connecting=Some(quota::gemini::Connect::start(self.quota.alias.clone(),self.quota.gemini_email.clone(),None,self.quota.connect_target.as_ref().and_then(|id|self.quota.config.accounts.iter().find(|a|&a.id==id)).and_then(|a|a.slot.clone())));}
+                    if ui.add_enabled(self.quota.gemini_connecting.is_none(),egui::Button::new("连接豆包浏览器")).clicked(){
+                        self.quota.note.clear();
+                        self.quota.gemini_connecting=Some(quota::gemini::Connect::start_doubao(self.quota.alias.clone(),self.quota.gemini_email.clone(),expected.clone()));
+                    }
+                    if ui.add_enabled(self.quota.gemini_connecting.is_none(),egui::Button::new("连接已登录的 Chrome")).clicked(){self.quota.note.clear();self.quota.gemini_connecting=Some(quota::gemini::Connect::start(self.quota.alias.clone(),self.quota.gemini_email.clone(),None,expected.clone()));}
                 });
-                ui.label(egui::RichText::new("使用已登录的 Chrome 144+，允许连接后验证额度，无需扩展。").size(12.0).color(ui.visuals().weak_text_color()));
-                ui.horizontal_wrapped(|ui|{ui.label("首次在 Chrome 开启原生连接：");ui.code("chrome://inspect/#remote-debugging");if ui.small_button("复制地址").clicked(){ui.ctx().copy_text("chrome://inspect/#remote-debugging".into());}});
-                ui.add(egui::Label::new(egui::RichText::new("Chrome 会请求浏览器会话访问权限。岛仔仅在连接时读取 Gemini 登录，完成后断开，后续使用本机加密会话刷新。").size(11.0).color(ui.visuals().weak_text_color())).wrap());
+                ui.label("首次连接时，在对应浏览器打开下方地址并开启远程调试。");
+                for (name,url) in [("豆包","doubao://inspect/#remote-debugging"),("Chrome 144+","chrome://inspect/#remote-debugging")]{
+                    ui.push_id(name,|ui|ui.horizontal_wrapped(|ui|{ui.label(name);ui.code(url);if ui.small_button("复制地址").clicked(){ui.ctx().copy_text(url.into());}}));
+                }
+                ui.add(egui::Label::new(egui::RichText::new("豆包连接需保留已授权的 Gemini 用量标签页。重启岛仔或豆包后需重新连接。Chrome 首次连接成功后可关闭浏览器，岛仔会用本机加密会话在后台刷新。").size(11.0).color(ui.visuals().weak_text_color())).wrap());
                 settings_control_row(ui,"Google 邮箱",80.0,|ui|{ui.add_sized([ui.available_width(),27.0],egui::TextEdit::singleline(&mut self.quota.gemini_email).vertical_align(egui::Align::Center).hint_text("可选：指定要连接的 Google 邮箱"))});
                 ui.collapsing("高级：手动 Cookie 连接",|ui|{
                     ui.label("在 Gemini 用量页按 F12，打开网络，刷新后找到 executeQuery 请求，复制 Cookie 请求头。");
                     ui.add_sized([ui.available_width(),27.0],egui::TextEdit::singleline(&mut self.quota.gemini_cookie).vertical_align(egui::Align::Center).password(true).hint_text("粘贴 Cookie 请求头"));
-                    if ui.add_enabled(self.quota.gemini_connecting.is_none() && !self.quota.gemini_cookie.trim().is_empty()&&!self.quota.gemini_email.trim().is_empty(),egui::Button::new("验证并连接")).clicked(){self.quota.note.clear();self.quota.gemini_connecting=Some(quota::gemini::Connect::start(self.quota.alias.clone(),self.quota.gemini_email.clone(),Some(std::mem::take(&mut self.quota.gemini_cookie)),self.quota.connect_target.as_ref().and_then(|id|self.quota.config.accounts.iter().find(|a|&a.id==id)).and_then(|a|a.slot.clone())));}
+                    if ui.add_enabled(self.quota.gemini_connecting.is_none() && !self.quota.gemini_cookie.trim().is_empty()&&!self.quota.gemini_email.trim().is_empty(),egui::Button::new("验证并连接")).clicked(){self.quota.note.clear();self.quota.gemini_connecting=Some(quota::gemini::Connect::start(self.quota.alias.clone(),self.quota.gemini_email.clone(),Some(std::mem::take(&mut self.quota.gemini_cookie)),expected.clone()));}
                 });
                 if self.quota.gemini_connecting.is_some(){ui.horizontal(|ui|{ui.spinner();ui.label("正在连接并验证 Gemini 额度…");if ui.button("取消").clicked(){self.quota.gemini_connecting=None;self.quota.note="已取消 Gemini 连接".into();}});ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));}
             }else if self.quota.provider==Provider::Doubao{

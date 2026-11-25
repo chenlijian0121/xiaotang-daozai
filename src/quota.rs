@@ -2,6 +2,27 @@
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs, io::Read, path::{Path, PathBuf}, sync::mpsc, time::{Duration, Instant}};
 use base64::Engine;
+#[path="codex_app_limits.rs"]
+mod codex_app_limits;
+use codex_app_limits::parse_codex_app_limits;
+#[path="codex_app_server.rs"]
+mod codex_app_server;
+#[path="antigravity_quota.rs"]
+mod antigravity;
+#[path="antigravity_settings.rs"]
+mod antigravity_settings;
+
+/// agy 状态栏进程从标准输入接收官方 JSON，只把额度快照交给岛仔主界面。
+pub fn collect_antigravity_statusline(input:impl Read)->Result<(),String>{antigravity::collect(input)}
+
+/// 用户点击「打开 agy」后启动官方交互客户端，登录和额度刷新由 agy 自行处理。
+pub(crate) fn open_antigravity_cli()->Result<(),String>{antigravity::open_cli()}
+
+/// 移除最后一张 Antigravity 卡片时清理本机快照，只卸载岛仔自己注册的采集命令。
+pub(crate) fn disconnect_antigravity()->Result<(),String>{
+    antigravity::clear_snapshot()?;
+    antigravity_settings::uninstall()
+}
 #[path="grok_quota.rs"]
 pub(crate) mod grok;
 #[path="gemini_quota.rs"]
@@ -36,10 +57,10 @@ impl Discovery {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Provider { #[default] Codex, Claude, Kimi, GrokBot, Gemini, ZCode, WorkBuddy, DeepSeek, OpenCodeGo, MiniMax, Glm, NewApi, OneApi, Sub2Api, Kiro, Doubao, RelayGeneral, RelayCustom }
+pub enum Provider { #[default] Codex, Claude, Kimi, GrokBot, Gemini, ZCode, WorkBuddy, DeepSeek, OpenCodeGo, MiniMax, Glm, NewApi, OneApi, Sub2Api, Kiro, Doubao, RelayGeneral, RelayCustom, Antigravity }
 impl Provider {
-    pub const ALL: [Self; 18] = [Self::Codex, Self::Claude, Self::Kimi, Self::GrokBot, Self::Gemini, Self::ZCode, Self::WorkBuddy, Self::DeepSeek, Self::OpenCodeGo, Self::MiniMax, Self::Glm, Self::NewApi, Self::OneApi, Self::Sub2Api, Self::Kiro, Self::Doubao, Self::RelayGeneral, Self::RelayCustom];
-    pub fn name(self) -> &'static str { match self {Self::Codex=>"Codex",Self::Claude=>"Claude",Self::Kimi=>"Kimi",Self::GrokBot=>"Grok Bot",Self::Gemini=>"Gemini",Self::ZCode=>"ZCode",Self::WorkBuddy=>"WorkBuddy",Self::DeepSeek=>"DeepSeek",Self::OpenCodeGo=>"OpenCode Go",Self::MiniMax=>"MiniMax",Self::Glm=>"GLM",Self::NewApi=>"New API",Self::OneApi=>"One API",Self::Sub2Api=>"Sub2API",Self::Kiro=>"Kiro",Self::Doubao=>"豆包",Self::RelayGeneral=>"通用余额",Self::RelayCustom=>"自定义查询"} }
+    pub const ALL: [Self; 19] = [Self::Codex, Self::Claude, Self::Kimi, Self::GrokBot, Self::Gemini, Self::Antigravity, Self::ZCode, Self::WorkBuddy, Self::DeepSeek, Self::OpenCodeGo, Self::MiniMax, Self::Glm, Self::NewApi, Self::OneApi, Self::Sub2Api, Self::Kiro, Self::Doubao, Self::RelayGeneral, Self::RelayCustom];
+    pub fn name(self) -> &'static str { match self {Self::Codex=>"Codex",Self::Claude=>"Claude",Self::Kimi=>"Kimi",Self::GrokBot=>"Grok Bot",Self::Gemini=>"Gemini",Self::Antigravity=>"Antigravity",Self::ZCode=>"ZCode",Self::WorkBuddy=>"WorkBuddy",Self::DeepSeek=>"DeepSeek",Self::OpenCodeGo=>"OpenCode Go",Self::MiniMax=>"MiniMax",Self::Glm=>"GLM",Self::NewApi=>"New API",Self::OneApi=>"One API",Self::Sub2Api=>"Sub2API",Self::Kiro=>"Kiro",Self::Doubao=>"豆包",Self::RelayGeneral=>"通用余额",Self::RelayCustom=>"自定义查询"} }
     pub fn api_key(self)->bool{matches!(self,Self::OpenCodeGo|Self::MiniMax|Self::Glm)||self.relay()}
     pub fn relay(self)->bool{matches!(self,Self::NewApi|Self::OneApi|Self::Sub2Api|Self::RelayGeneral|Self::RelayCustom)}
     pub fn balance(self)->bool{matches!(self,Self::WorkBuddy|Self::DeepSeek)||self.relay()}
@@ -85,19 +106,45 @@ impl Config {
         if provider==Provider::WorkBuddy{return Err("请使用浏览器连接 WorkBuddy".into());}
         if provider==Provider::DeepSeek{return Err("请使用 API Key 连接 DeepSeek".into());}
         if provider==Provider::Gemini{return Err("请使用浏览器或 Cookie 连接 Gemini 网页账号".into());}
+        if provider==Provider::Antigravity{return Err("请连接本机 agy 客户端".into());}
         if provider==Provider::Doubao{return Err("请使用浏览器或 Cookie 连接豆包网页账号".into());}
         if provider==Provider::GrokBot{return self.import_grok(&source,&alias).map(|_|());}
         if provider==Provider::Claude{return self.import_claude(&source,&alias).map(|_|());}
+        if let Some(home)=local_codex_home(provider,&source){
+            return if self.add_local_codex(&alias,&home)?{Ok(())}else{Err("这个 Codex 账号已经添加".into())};
+        }
         if !source.is_file(){return Err("请选择已有的登录 JSON 文件".into());}
         let auth=credentials(provider,&source)?;
         if self.accounts.iter().filter(|a|a.provider==provider).any(|a|account_credentials(a).is_ok_and(|existing|same_login(&existing,&auth))){return Err("这个账号已经添加".into());}
         let path=fs::canonicalize(&source).unwrap_or(source);
         if self.accounts.iter().any(|a|a.provider==provider && a.source.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy())){return Err("这个登录文件已经添加".into());}
+        self.push_file_account(provider,&alias,path);
+        Ok(())
+    }
+    /// 登记已定位的账号文件，沿用首个账号的选中和置顶规则。
+    fn push_file_account(&mut self,provider:Provider,alias:&str,path:PathBuf){
         let next=self.accounts.iter().filter(|a|a.provider==provider).count()+1;
         let alias=if alias.trim().is_empty(){format!("{} · 账号 {}",provider.name(),next)}else{alias.trim().to_owned()};
         let id=format!("{}-{}",provider.name(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
         let pinned=self.accounts.is_empty();if pinned{self.selected=id.clone();}
-        self.accounts.push(Account{id,provider,alias,source:path,slot:None,enabled:true,pinned});Ok(())
+        self.accounts.push(Account{id,provider,alias,source:path,slot:None,enabled:true,pinned});
+    }
+    /// 用已核实的用户目录登记本机账号，返回是否新增。只在已有其他来源时尝试旧格式的跨文件去重。
+    fn add_local_codex(&mut self,alias:&str,home:&Path)->Result<bool,String>{
+        let source=fs::canonicalize(home.join("auth.json")).map_err(|_|"无法定位 Codex 登录文件")?;
+        if self.accounts.iter().any(|a|a.provider==Provider::Codex && local_codex_path(&a.source).as_ref()==Some(&source)){
+            return Ok(false);
+        }
+        let mut others=self.accounts.iter().filter(|a|a.provider==Provider::Codex).peekable();
+        if others.peek().is_some(){
+            if let Ok(auth)=credentials(Provider::Codex,&source){
+                if others.any(|a|account_credentials(a).is_ok_and(|old|same_login(&old,&auth))){
+                    return Ok(false);
+                }
+            }
+        }
+        self.push_file_account(Provider::Codex,alias,source);
+        Ok(true)
     }
     pub(crate) fn connect_grok(&mut self,slot:String,alias:String){
         if let Some(a)=self.accounts.iter_mut().find(|a|a.provider==Provider::GrokBot && a.slot.as_deref()==Some(&slot)){
@@ -113,6 +160,31 @@ impl Config {
         }
         let id=format!("WorkBuddy-{slot}");let pinned=true;
         self.selected=id.clone();self.accounts.push(Account{id:id.clone(),provider:Provider::WorkBuddy,alias,source:PathBuf::new(),slot:Some(slot),enabled:true,pinned});id
+    }
+    /// 连接当前用户的 agy 状态栏，保留其他服务。持久化卡片失败时撤回此次新增的回调。
+    pub(crate) fn connect_antigravity(&mut self,alias:&str)->Result<(),String>{
+        if !antigravity::available(){return Err("未找到本机 Antigravity CLI，请先安装 agy".into());}
+        let mut candidate=self.clone();
+        candidate.register_antigravity(alias);
+        let installed=antigravity_settings::install()?;
+        if let Err(error)=candidate.save_checked(){
+            if installed{
+                antigravity_settings::uninstall().map_err(|cleanup|format!("{error}；{cleanup}"))?;
+            }
+            return Err(error);
+        }
+        *self=candidate;
+        Ok(())
+    }
+    /// 本机只有一个活动的 agy 登录来源。重连沿用账号 ID、顺序和置顶偏好。
+    fn register_antigravity(&mut self,alias:&str){
+        let alias=alias.trim();
+        if let Some(account)=self.accounts.iter_mut().find(|a|a.provider==Provider::Antigravity){
+            account.enabled=true;
+            if !alias.is_empty(){account.alias=alias.into();}
+            return;
+        }
+        self.push_file_account(Provider::Antigravity,if alias.is_empty(){"本机 agy"}else{alias},PathBuf::new());
     }
     pub(crate) fn connect_gemini(&mut self,slot:String,alias:String)->String{
         if let Some(a)=self.accounts.iter_mut().find(|a|a.provider==Provider::Gemini && a.slot.as_deref()==Some(&slot)){
@@ -170,7 +242,16 @@ impl Config {
     }
     fn discover_files(&mut self,candidates:&[(Provider,PathBuf)])->Vec<String>{
         let mut notes=Vec::new();
-        for (provider,path) in candidates.iter().filter(|(_,p)|p.is_file()){
+        for (provider,path) in candidates{
+            if let Some(home)=local_codex_home(*provider,path){
+                // 发现已有账号时保留其备注、排序与启用状态；额度验证由后台刷新执行。
+                let next=self.accounts.iter().filter(|a|a.provider==Provider::Codex).count()+1;
+                if let Err(error)=self.add_local_codex(&format!("Codex · 本机 {next}"),&home){
+                    notes.push(format!("Codex：{error}"));
+                }
+                continue;
+            }
+            if !path.is_file(){continue;}
             if *provider==Provider::Claude{if let Err(error)=self.import_claude(path,""){notes.push(error);}continue;}
             if *provider==Provider::Kiro{
                 let source=fs::canonicalize(path).unwrap_or_else(|_|path.clone());
@@ -256,6 +337,7 @@ fn codex_window(v:&Value)->Option<Window>{
     Some(Window{label:cadence(seconds),seconds,remaining:(100.0-used).clamp(0.0,100.0) as f32,reset:reset(&v["reset_at"]),amount:None})
 }
 pub fn parse(provider:Provider,v:&Value)->Result<Snapshot,String>{
+    if provider==Provider::Antigravity{return Err("请使用本机 agy 状态栏提供的额度记录".into());}
     if provider.api_key(){return Err("请使用对应服务的地区及协议解析额度".into());}
     if provider==Provider::WorkBuddy{return workbuddy::parse(v);}
     if provider==Provider::DeepSeek{return deepseek::parse(v);}
@@ -296,6 +378,27 @@ pub fn parse(provider:Provider,v:&Value)->Result<Snapshot,String>{
 }
 
 struct Credential {token:String,account_id:Option<String>,identity:Option<String>,stamp:Option<std::time::SystemTime>}
+/// 规范化现有文件。粘贴的盘符路径有时会保留一层显示用的反斜线转义。
+fn local_codex_path(source:&Path)->Option<PathBuf>{
+    if let Ok(path)=fs::canonicalize(source){return Some(path);}
+    let text=source.to_str()?;
+    let drive=text.strip_prefix(r"\\\\?")?.trim_start_matches('\\');
+    if !matches!(drive.as_bytes(),[letter,b':',b'\\',..] if letter.is_ascii_alphabetic()){return None;}
+    fs::canonicalize(drive).ok()
+}
+/// 仅将默认目录和显式 CODEX_HOME 下的 auth.json 交给官方客户端，其他导入文件保持账号隔离。
+fn local_codex_home(provider:Provider,source:&Path)->Option<PathBuf>{
+    if provider!=Provider::Codex{return None;}
+    let selected=local_codex_path(source)?;
+    if !selected.is_file(){return None;}
+    let profile=std::env::var_os("USERPROFILE").or_else(||std::env::var_os("HOME")).map(|p|PathBuf::from(p).join(".codex"));
+    let configured=std::env::var_os("CODEX_HOME").filter(|p|!p.is_empty()).map(PathBuf::from);
+    let home=[configured,profile].into_iter().flatten().find(|home|{
+        fs::canonicalize(home.join("auth.json")).is_ok_and(|p|p==selected)
+    })?;
+    if !codex_app_server::available(){return None;}
+    std::path::absolute(home).ok()
+}
 fn same_login(a:&Credential,b:&Credential)->bool{a.token==b.token||a.identity.as_ref().zip(b.identity.as_ref()).is_some_and(|(a,b)|a==b)}
 fn login_json(path:&Path)->Result<Value,String>{
     let raw=fs::read(path).map_err(|_|"无法读取登录文件".to_string())?;
@@ -415,6 +518,16 @@ fn http_agent_with_connect_timeout(timeout:Duration)->ureq::Agent{
     if server.is_empty(){None}else if server.contains("://"){Some(server.into())}else{Some(format!("http://{server}"))}
 }
 fn fetch(agent:&ureq::Agent,account:&Account)->Result<Snapshot,(String,u64)>{
+    if account.provider==Provider::Antigravity{return antigravity::fetch();}
+    if let Some(home)=local_codex_home(account.provider,&account.source){
+        // 额度请求在后台执行；期间切换登录时丢弃在途结果，避免展示上一个账号的额度。
+        let source=home.join("auth.json");
+        let stamp=||fs::metadata(&source).and_then(|m|m.modified()).ok();
+        let before=stamp();
+        let snapshot=codex_app_server::fetch(&home)?;
+        if before!=stamp(){return Err(("登录信息已变化，请刷新额度".into(),0));}
+        return Ok(snapshot);
+    }
     if account.provider.api_key(){return api::fetch(agent,account);}
     if account.provider==Provider::Claude{return claude::fetch(account).map_err(|e|(e,0));}
     if account.provider==Provider::ZCode{return zcode::fetch(agent,account).map_err(|e|(e,60));}
@@ -437,6 +550,65 @@ fn fetch(agent:&ureq::Agent,account:&Account)->Result<Snapshot,(String,u64)>{
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test]
+    fn antigravity_card_keeps_gemini_web_and_reconnects_in_place(){
+        let mut config=Config::default();
+        config.connect_gemini("web-account".into(),"网页".into());
+        let web=config.accounts[0].clone();
+        config.register_antigravity("");
+        assert_eq!(config.selected,web.id);
+        assert_eq!(config.accounts[1].alias,"本机 agy");
+        let agy_id=config.accounts[1].id.clone();
+        config.accounts[1].enabled=false;
+        config.register_antigravity("编程额度");
+        assert_eq!(config.accounts.len(),2);
+        assert_eq!(config.accounts[0],web);
+        assert_eq!(config.accounts[1].id,agy_id);
+        assert!(config.accounts[1].enabled);
+        assert_eq!(config.accounts[1].alias,"编程额度");
+        assert_eq!(Config::from_json(&config.json()),config);
+    }
+    #[test]
+    fn codex_protected_profile_registration_keeps_existing_preferences(){
+        let home=std::env::temp_dir().join(format!("daozai-codex-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir(&home).unwrap();
+        let source=home.join("auth.json");
+        // 用合成的非 JSON 字节模拟岛仔看到的受保护内容，整个登记过程只需要文件引用。
+        fs::write(&source,[0xff,0xfe,0x01]).unwrap();
+        let mut config=Config::default();
+        assert!(config.add_local_codex("本机",&home).unwrap());
+        config.accounts[0].enabled=false;
+        let saved=config.clone();
+        assert!(!config.add_local_codex("重复发现",&home).unwrap());
+        assert_eq!(config,saved);
+        assert!(local_codex_home(Provider::Codex,&source).is_none(),"自选文件不能串用本机登录态");
+        assert_eq!(fs::read(&source).unwrap(),[0xff,0xfe,0x01]);
+        fs::remove_file(&source).unwrap();
+        fs::remove_dir(home).unwrap();
+    }
+
+    #[test]
+    #[ignore="需本机 Codex 已登录 ChatGPT，调用官方服务核验真实额度"]
+    fn codex_local_quota_end_to_end(){
+        let home=std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(".codex"));
+        let source=home.join("auth.json");
+        assert!(local_codex_home(Provider::Codex,&source).is_some());
+        let mut config=Config::default();
+        assert!(config.discover_files(&[(Provider::Codex,source.clone())]).is_empty());
+        assert_eq!(config.accounts.len(),1);
+        // 手动粘贴的盘符路径可能保留重复的前导反斜线，应与自动发现定位到同一账号。
+        if matches!(source.components().next(),Some(std::path::Component::Prefix(p)) if matches!(p.kind(),std::path::Prefix::Disk(_))){
+            let pasted=PathBuf::from(format!(r"\\\\?\{}",source.display()));
+            assert_eq!(local_codex_path(&pasted),fs::canonicalize(&source).ok());
+            let mut manual=Config::default();
+            manual.add(Provider::Codex,"本机".into(),pasted).unwrap();
+            assert_eq!(manual.accounts[0].source,config.accounts[0].source);
+        }
+        assert!(config.add(Provider::Codex,"重复".into(),source).is_err());
+        let snapshot=fetch(&http_agent(),&config.accounts[0]).unwrap();
+        assert!(!snapshot.windows.is_empty());
+        assert!(snapshot.windows.iter().all(|w|(0.0..=100.0).contains(&w.remaining)));
+    }
     #[test] fn lightweight_quota_startup_has_no_unused_workers(){
         let mut service=Service::start();assert!(service.workers.is_empty(),"未启用额度来源时不应创建后台线程");
         assert!(service.refresh(vec![]));assert!(service.workers.is_empty());

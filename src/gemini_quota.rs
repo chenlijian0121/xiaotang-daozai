@@ -1,5 +1,5 @@
 //! Gemini 网页订阅额度，接口与字段映射参考 CodexBar 的 gemini-web 插件。
-//! 浏览器连接只在用户点击时读取会话；会话由 Windows DPAPI 加密保存。
+//! Chrome 与手动模式通过 DPAPI 保存会话。豆包只保存账号标记，刷新复用用户授权的浏览器连接。
 use super::{Account,Snapshot,Window};
 use serde_json::{json,Value};
 use std::{fs,io::Read,path::PathBuf,sync::{mpsc,Arc,atomic::{AtomicBool,Ordering}}};
@@ -86,43 +86,204 @@ pub(super) fn protect(raw:&[u8],encrypt:bool)->Result<Vec<u8>,String>{
 }
 #[cfg(not(windows))]
 pub(super) fn protect(_raw:&[u8],_encrypt:bool)->Result<Vec<u8>,String>{Err("当前系统暂不支持安全保存登录会话".into())}
-fn save(session:&Session)->Result<String,String>{
-    let slot=slot(&session.email);let path=session_path(&slot)?;
-    let raw=json!({"email":session.email,"cookie":session.cookie}).to_string();let encrypted=protect(raw.as_bytes(),true)?;
-    fs::create_dir_all(path.parent().unwrap()).map_err(|_|"无法保存 Gemini 登录")?;
-    crate::model::atomic_write(&path,&encrypted).map_err(|_|"无法保存 Gemini 登录")?;Ok(slot)
+/// 磁盘账号记录。旧版 Chrome/手动记录继续使用原有字段；豆包记录只标识账号及连接方式。
+enum SavedLogin {
+    Cookie(Session),
+    Doubao(String),
 }
-fn load(account:&Account)->Result<Session,String>{
+
+impl SavedLogin {
+    /// 返回已核验并规范化的邮箱，用于重连校验和账号槽定位。
+    fn address(&self) -> &str {
+        match self {
+            Self::Cookie(session) => &session.email,
+            Self::Doubao(address) => address,
+        }
+    }
+
+    /// 生成 DPAPI 的明文输入。豆包的浏览器连接不能序列化，账号记录也不含登录凭据。
+    fn record(&self) -> Value {
+        match self {
+            Self::Cookie(session) => json!({"email": session.email, "cookie": session.cookie}),
+            Self::Doubao(address) => json!({"email": address, "mode": "doubao"}),
+        }
+    }
+
+    /// 根据旧版字段或显式模式恢复记录，同时检查记录中的邮箱与配置的槽位一致。
+    fn from_record(value: &Value, expected: &str) -> Result<Self, String> {
+        let address = email(value["email"].as_str().ok_or(LOGIN_ERROR)?)?;
+        if slot(&address) != expected {
+            return Err("Gemini 账号不一致，请重新连接".into());
+        }
+        match (value.get("mode"), value.get("cookie")) {
+            (None, Some(header)) => Ok(Self::Cookie(Session {
+                email: address,
+                cookie: cookie(header.as_str().ok_or(LOGIN_ERROR)?)?,
+            })),
+            (Some(mode), None) if mode.as_str() == Some("doubao") => Ok(Self::Doubao(address)),
+            _ => Err(LOGIN_ERROR.into()),
+        }
+    }
+}
+
+/// 将已验证的记录原子写入该邮箱的 DPAPI 文件；写入失败不替换原记录。
+fn save(login:&SavedLogin)->Result<(),String>{
+    let path=session_path(&slot(login.address()))?;
+    let raw=login.record().to_string();let encrypted=protect(raw.as_bytes(),true)?;
+    fs::create_dir_all(path.parent().unwrap()).map_err(|_|"无法保存 Gemini 登录")?;
+    crate::model::atomic_write(&path,&encrypted).map_err(|_|"无法保存 Gemini 登录".to_owned())
+}
+/// 按账号槽加载记录，解密及身份校验均成功后才返回刷新方式。
+fn load(account:&Account)->Result<SavedLogin,String>{
     let expected=account.slot.as_deref().ok_or(LOGIN_ERROR)?;let path=session_path(expected)?;
     let raw=fs::read(path).map_err(|_|LOGIN_ERROR)?;let raw=protect(&raw,false)?;
     let value:Value=serde_json::from_slice(&raw).map_err(|_|LOGIN_ERROR)?;
-    let email=email(value["email"].as_str().ok_or(LOGIN_ERROR)?)?;
-    if slot(&email)!=expected{return Err("Gemini 账号不一致，请重新连接".into());}
-    Ok(Session{email,cookie:cookie(value["cookie"].as_str().ok_or(LOGIN_ERROR)?)?})
+    SavedLogin::from_record(&value, expected)
 }
-pub fn forget(account:&Account){if let Some(path)=account.slot.as_deref().and_then(|s|session_path(s).ok()){let _=fs::remove_file(path);}}
-pub fn address(account:&Account)->Option<String>{load(account).ok().map(|s|s.email)}
+const RECONNECT_DOUBAO: &str = "豆包浏览器连接已断开，请在岛仔重新连接已登录的豆包";
+
+/// 每个账号独立持有已经批准的连接。查表后释放全局锁，避免一个页面等待阻塞其他账号。
+#[cfg(windows)]
+type LiveDoubao = Arc<std::sync::Mutex<browser::DoubaoConnection>>;
+#[cfg(windows)]
+static DOUBAO_LINKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, LiveDoubao>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 用户完成连接、切换方式或移除账号后替换当前句柄。旧连接在全局锁外释放。
+#[cfg(windows)]
+fn replace_doubao(slot: &str, next: Option<browser::DoubaoConnection>) {
+    let previous = {
+        let mut links = DOUBAO_LINKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match next {
+            Some(connection) => links.insert(slot.to_owned(), Arc::new(std::sync::Mutex::new(connection))),
+            None => links.remove(slot),
+        }
+    };
+    drop(previous);
+}
+
+/// 刷新仅访问本次进程中用户已批准的句柄。缺少句柄时交给界面提示重连。
+#[cfg(windows)]
+fn refresh_doubao(address: &str) -> Result<Snapshot, (String, u64)> {
+    // 缺少手动授权时无需定时退避；浏览器返回的服务端限流时间则交给共用调度器。
+    let disconnected = || (RECONNECT_DOUBAO.to_owned(), 0);
+    let connection = DOUBAO_LINKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&slot(address)).cloned().ok_or_else(disconnected)?;
+    let mut connection = connection.lock().map_err(|_| disconnected())?;
+    connection.refresh(address)
+}
+
+/// 移除账号时释放当前授权句柄，并清理该账号的本地记录。
+pub fn forget(account:&Account){
+    if let Some(slot) = account.slot.as_deref() {
+        #[cfg(windows)]
+        replace_doubao(slot, None);
+        if let Ok(path) = session_path(slot) {let _=fs::remove_file(path);}
+    }
+}
+/// 返回已校验的账号邮箱，供重连表单预填。
+pub fn address(account:&Account)->Option<String>{load(account).ok().map(|login|login.address().to_owned())}
+/// 通过账号保存的方式刷新额度；豆包只使用现有授权，错误交给界面标记上次记录。
 pub fn fetch(agent:&ureq::Agent,account:&Account)->Result<Snapshot,(String,u64)>{
-    let session=load(account).map_err(|e|(e,0))?;request(agent,&request_url(&session.email),&session)
+    match load(account).map_err(|e|(e,0))? {
+        SavedLogin::Cookie(session) => request(agent, &request_url(&session.email), &session),
+        SavedLogin::Doubao(address) => {
+            #[cfg(windows)]
+            { refresh_doubao(&address) }
+            #[cfg(not(windows))]
+            { let _ = address; Err((RECONNECT_DOUBAO.into(), 0)) }
+        }
+    }
 }
-pub struct Connected {pub slot:String,pub label:String,pub snapshot:Snapshot,session:Session}
-impl Connected {pub fn finish(self)->Result<Self,String>{save(&self.session)?;Ok(self)}}
+
+/// 待界面确认的连接结果；关闭对话框或取消时，未提交的豆包句柄随结果释放。
+pub struct Connected {
+    pub slot: String,
+    pub label: String,
+    pub snapshot: Snapshot,
+    login: SavedLogin,
+    #[cfg(windows)]
+    connection: Option<browser::DoubaoConnection>,
+}
+
+impl Connected {
+    /// 根据用户备注和已核验邮箱构造显示信息，连接提交前不保存任何记录。
+    fn new(alias: String, login: SavedLogin, snapshot: Snapshot) -> Self {
+        let owner = login.address();
+        let label = if alias.trim().is_empty() { format!("Gemini · {owner}") } else { alias.trim().into() };
+        Self { slot: slot(owner), label, snapshot, login, #[cfg(windows)] connection: None }
+    }
+
+    /// 保存成功后再交接进程内的授权连接，保存失败不会覆盖当前可用的句柄。
+    pub fn finish(mut self) -> Result<Self, String> {
+        save(&self.login)?;
+        #[cfg(windows)]
+        match &self.login {
+            SavedLogin::Cookie(_) => replace_doubao(&self.slot, None),
+            SavedLogin::Doubao(_) => {
+                if let Some(connection) = self.connection.take() {
+                    replace_doubao(&self.slot, Some(connection));
+                }
+            }
+        }
+        Ok(self)
+    }
+}
+
+/// 指定旧账号重连时，拒绝用另一个浏览器账号覆盖原配置。
+fn verify_owner(address: &str, expected: Option<&str>) -> Result<(), String> {
+    if expected.is_some_and(|s| s != slot(address)) {
+        return Err("当前浏览器是另一个 Google 账号，请切回原账号后重新连接".into());
+    }
+    Ok(())
+}
 pub struct Connect {rx:mpsc::Receiver<Result<Connected,String>>,cancel:Arc<AtomicBool>}
 impl Connect {
+    /// 启动既有 Chrome 或手动连接；expected 为重连时需要匹配的账号槽。
     pub fn start(alias:String,address:String,header:Option<String>,expected:Option<String>)->Self{
-        let(tx,rx)=mpsc::channel();let cancel=Arc::new(AtomicBool::new(false));let stopped=cancel.clone();
-        std::thread::spawn(move||{let result=(||{
+        Self::spawn(move |stopped| {
             let session=if let Some(header)=header{Session{email:email(&address)?,cookie:cookie(&header)?}}else{
-                #[cfg(windows)]{browser::login(&address,&stopped)?}
+                #[cfg(windows)]{browser::login(&address,stopped)?}
                 #[cfg(not(windows))]{return Err("Chrome 原生连接暂仅支持 Windows，可使用手动 Cookie 连接".into());}
             };
             if stopped.load(Ordering::Relaxed){return Err("已取消 Gemini 连接".into());}
-            if expected.as_deref().is_some_and(|s|s!=slot(&session.email)){return Err("当前浏览器是另一个 Google 账号，请切回原账号后重新连接".into());}
+            verify_owner(&session.email, expected.as_deref())?;
             let snapshot=request(&super::http_agent(),&request_url(&session.email),&session).map_err(|e|e.0)?;
-            if stopped.load(Ordering::Relaxed){return Err("已取消 Gemini 连接".into());}
-            let slot=slot(&session.email);let label=if alias.trim().is_empty(){format!("Gemini · {}",session.email)}else{alias.trim().into()};
-            Ok(Connected{slot,label,snapshot,session})
-        })();let _=tx.send(result);});Self{rx,cancel}
+            Ok(Connected::new(alias, SavedLogin::Cookie(session), snapshot))
+        })
+    }
+
+    /// 从用户选择的豆包用量页读取额度。address 可留空，expected 限定旧账号重连的目标。
+    pub fn start_doubao(alias: String, address: String, expected: Option<String>) -> Self {
+        Self::spawn(move |stopped| {
+            #[cfg(windows)]
+            {
+                let (connection, owner, snapshot) = browser::DoubaoConnection::connect(&address, stopped)?;
+                verify_owner(&owner, expected.as_deref())?;
+                let mut connected = Connected::new(alias, SavedLogin::Doubao(owner), snapshot);
+                connected.connection = Some(connection);
+                Ok(connected)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (alias, address, expected, stopped);
+                Err("豆包浏览器原生连接暂仅支持 Windows".into())
+            }
+        })
+    }
+
+    /// 两种连接入口共用可取消的后台任务；通过校验后仍需等待界面调用 finish 才会生效。
+    fn spawn(task: impl FnOnce(&AtomicBool) -> Result<Connected, String> + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stopped = cancel.clone();
+        std::thread::spawn(move || {
+            let result = task(&stopped).and_then(|connected| {
+                if stopped.load(Ordering::Relaxed) { Err("已取消 Gemini 连接".into()) } else { Ok(connected) }
+            });
+            let _ = tx.send(result);
+        });
+        Self { rx, cancel }
     }
     pub fn poll(&self)->Option<Result<Connected,String>>{self.rx.try_recv().ok()}
     #[cfg(test)]
@@ -133,12 +294,83 @@ impl Drop for Connect {fn drop(&mut self){self.cancel.store(true,Ordering::Relax
 #[cfg(test)]
 pub(crate) fn simulated_connected()->Connected{
     let session=Session{email:"synthetic@example.com".into(),cookie:"SID=synthetic-only".into()};
-    Connected{slot:slot(&session.email),label:"Gemini 测试".into(),snapshot:Snapshot::default(),session}
+    Connected::new("Gemini 测试".into(), SavedLogin::Cookie(session), Snapshot::default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 新记录不含登录凭据；旧版记录和账号校验保持兼容，歧义记录不能触发任何一种刷新方式。
+    #[test]
+    fn gemini_doubao_record_contains_only_browser_and_owner() {
+        let address = "do-not-connect@example.com";
+        let owner = slot(address);
+        let record = SavedLogin::Doubao(address.into()).record();
+        assert_eq!(record, json!({"email":address,"mode":"doubao"}));
+        assert!(matches!(SavedLogin::from_record(&record, &owner), Ok(SavedLogin::Doubao(value)) if value == address));
+        assert!(SavedLogin::from_record(&record, &slot("another@example.com")).is_err());
+        let legacy = json!({"email":address,"cookie":"SID=synthetic"});
+        assert!(matches!(SavedLogin::from_record(&legacy, &owner), Ok(SavedLogin::Cookie(value)) if value.email == address));
+        for invalid in [json!({"email":address,"mode":"other"}), json!({"email":address,"mode":"doubao","cookie":"SID=fixture"})] {
+            assert!(SavedLogin::from_record(&invalid, &owner).is_err());
+        }
+    }
+
+    /// 进程中没有已授权句柄时，后台刷新立即提示从设置重新连接。
+    #[cfg(windows)]
+    #[test]
+    fn gemini_doubao_background_refresh_requires_existing_approval() {
+        let error = refresh_doubao("never-connected@example.com").unwrap_err();
+        assert_eq!(error, (RECONNECT_DOUBAO.to_owned(), 0));
+    }
+
+    /// 使用调用方持有环境锁的合成连接，验证从提交账号到刷新与移除的完整生命周期。
+    #[cfg(windows)]
+    pub(super) fn assert_doubao_handle_lifecycle(
+        connection: browser::DoubaoConnection,
+        address: String,
+        snapshot: Snapshot,
+    ) {
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = temp.join(format!("daozai-gemini-handoff-{}-{stamp}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let previous = std::env::var_os("DAOZAI_DATA_DIR");
+        std::env::set_var("DAOZAI_DATA_DIR", &dir);
+        let owner = slot(&address);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut connected = Connected::new("合成豆包账号".into(), SavedLogin::Doubao(address.clone()), snapshot);
+            connected.connection = Some(connection);
+            assert!(refresh_doubao(&address).is_err(), "提交前后台不能使用待确认连接");
+            connected.finish().unwrap();
+            let mut config = super::super::Config::default();
+            let id = config.connect_gemini(owner.clone(), "合成豆包账号".into());
+            let account = config.accounts.iter().find(|account| account.id == id).unwrap();
+            assert_eq!(load(account).unwrap().record(), json!({"email":address,"mode":"doubao"}));
+            let agent = super::super::http_agent();
+            let refreshed = fetch(&agent, account).unwrap();
+            assert_eq!(refreshed.windows[0].remaining, 75.0);
+            assert_eq!(refreshed.windows[0].reset, Some(1893486251));
+            assert_eq!(fetch(&agent, account).unwrap_err().1, 85);
+            let (message, wait) = fetch(&agent, account).unwrap_err();
+            assert!(message.contains("切换"));
+            assert_eq!(wait, 0);
+            forget(account);
+            assert!(!session_path(&owner).unwrap().exists());
+            assert_eq!(refresh_doubao(&address).unwrap_err(), (RECONNECT_DOUBAO.to_owned(), 0));
+        }));
+        // 即使断言失败，也要释放授权句柄并恢复进程环境，避免干扰后续用例。
+        replace_doubao(&owner, None);
+        match previous {
+            Some(value) => std::env::set_var("DAOZAI_DATA_DIR", value),
+            None => std::env::remove_var("DAOZAI_DATA_DIR"),
+        }
+        assert_eq!(dir.canonicalize().unwrap().parent(), Some(temp.as_path()));
+        fs::remove_dir_all(&dir).unwrap();
+        if let Err(error) = result { std::panic::resume_unwind(error); }
+    }
+
     fn response(five:Value,week:Value)->Value{json!([{"data":{"viewer":{"rpcs":{"getUsageInfo":{"subscriptionTier":"TIER1","pools":[{"poolType":"GXU_FIVE_HOURLY","percentageUsed":five,"gxu":{"windowRefreshesAt":"2030-01-01T08:24:11Z"}},{"poolType":"GXU_WEEKLY","percentageUsed":week,"gxu":{"windowRefreshesAt":"2030-01-04T03:24:11Z"}}]}}}},"errors":[{"message":"unrelated upsell"}]}])}
     #[test] fn gemini_fractional_usage_and_real_resets(){let s=parse(&response(json!(0.24),json!(0.01786011))).unwrap();assert_eq!(s.plan,"AI Pro");assert_eq!(s.rings().len(),2);assert_eq!(s.windows[0].remaining,76.0);assert!((s.windows[1].remaining-98.21399).abs()<0.001);assert_eq!(s.windows[0].reset,Some(1893486251));assert_eq!(s.windows[0].seconds,Some(18000));assert_eq!(s.windows[1].seconds,Some(604800));}
     #[test] fn gemini_zero_exhaustion_and_missing_windows(){let s=parse(&response(json!(0),json!(1))).unwrap();assert_eq!(s.windows[0].remaining,100.0);assert_eq!(s.windows[1].remaining,0.0);for bad in [Value::Null,json!(-1),json!("0.25"),json!("NaN")]{let s=parse(&response(bad.clone(),json!(0.5))).unwrap();assert_eq!(s.rings().len(),1);assert_eq!(s.rings()[0].label,"本周");assert!(parse(&response(bad.clone(),bad)).is_err());}assert_eq!(parse(&response(json!(1.2),Value::Null)).unwrap().windows[0].remaining,0.0);}

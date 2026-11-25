@@ -1039,6 +1039,13 @@ mod open_path_tests {
 }
 
 fn main() -> std::process::ExitCode {
+    // agy 的状态栏回调是短进程，只接收管道输入，避免打开窗口或激活现有岛仔实例。
+    if std::env::args_os().nth(1).as_deref()==Some(std::ffi::OsStr::new("--antigravity-statusline")){
+        return match daozai::quota::collect_antigravity_statusline(std::io::stdin().lock()){
+            Ok(())=>std::process::ExitCode::SUCCESS,
+            Err(_)=>std::process::ExitCode::FAILURE,
+        };
+    }
     diagnostics::install();
     // 收集诊断：在单实例检查、创建窗口和初始化显卡之前处理，岛仔启动即崩溃、卡死时也能用。
     #[cfg(windows)]

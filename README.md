@@ -103,6 +103,7 @@ Windows 桌面伙伴，把消息、音乐、日程、天气和 AI 额度放到�
 - **Kiro**：只读识别 Kiro 登录缓存并核验用户，显示套餐、有效试用与赠送 / 加购点数及明细，超额上限单独显示；支持美国东部和欧洲中部区域。不自动续期，登录过期时请在 Kiro 中重新登录。
 - **WorkBuddy**：查看剩余积分；优先识别本机客户端登录，也可在默认浏览器完成授权。
 - **Gemini**：支持 Chrome 144+ 原生授权连接，读取官网的 5 小时与每周额度，无需扩展。先在 Chrome 登录 Gemini，首次在 `chrome://inspect/#remote-debugging` 开启连接，回岛仔点击连接并在 Chrome 允许授权；会话加密保存在本机，后续独立刷新。高级设置保留手动 Cookie 连接。
+  - 使用豆包浏览器时，在 `doubao://inspect/#remote-debugging` 开启远程调试，用豆包打开 [Gemini 用量页](https://gemini.google.com/usage) 并登录，再回岛仔点击「连接豆包浏览器」并在豆包中允许。保持用量页打开即可刷新额度。重启岛仔或豆包后需重新连接。同时打开多个用量页时，可在岛仔填写目标 Google 邮箱。
 - **DeepSeek**：使用 API Key 连接，查看账户余额、充值与赠送金额。
 - **中转站**：自动识别通用余额、New API 和 Sub2API，保留 One API 兼容计费接口；New API 可用用户 Token 查询账户余额。高级设置支持粘贴 CC Switch 的 `request` / `extractor` 自定义查询脚本，脚本与凭据加密保存在本机。
 

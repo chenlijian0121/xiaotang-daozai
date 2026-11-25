@@ -33,6 +33,9 @@ fn gemini_connect_form_opens_default_browser_without_claiming_connection(){
         let texts=h.shapes.iter().filter_map(|s|if let egui::Shape::Text(t)=&s.shape{Some(t.galley.text())}else{None}).collect::<Vec<_>>();
         assert!(texts.contains(&"打开默认浏览器登录"),"Gemini 应在系统默认浏览器中登录");
         assert!(texts.contains(&"连接已登录的 Chrome"),"Gemini 应支持本人授权连接现有 Chrome 会话");
+        // 两种原生连接各自使用自己的设置页，不能把豆包用户再次引导到 Chrome。
+        assert!(texts.contains(&"连接豆包浏览器"));
+        assert!(texts.iter().any(|s|s.contains("doubao://inspect/#remote-debugging")));
         assert!(texts.iter().any(|s|s.contains("chrome://inspect/#remote-debugging")),"首次连接应提供 Chrome 原生设置入口");
         assert!(!texts.iter().any(|s|s.contains("自动连接")),"打开官网不能表示岛仔已获得登录会话");
         assert!(!texts.iter().any(|s|s.contains("Kimi 浏览器扩展")),"Gemini 连接不应要求额外安装扩展");
@@ -49,6 +52,35 @@ fn gemini_connect_form_opens_default_browser_without_claiming_connection(){
             raster.buf.fill([0.08,0.09,0.12,1.0]);raster.draw(&h.ctx.tessellate(h.shapes.clone(),1.0),1.0);let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);
             image::save_buffer(dest.join(if dark{"dark.png"}else{"light.png"}),&rgba,640,760,image::ColorType::Rgba8).unwrap();
         }
+    }
+}
+
+#[test]
+fn gemini_partial_save_keeps_the_previous_account_list(){
+    let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for fail_config in [true,false]{
+        // H 为每次调用生成隔离数据目录，分别在配置保存和账号记录保存处制造失败。
+        let mut h=H::new();
+        let dir=crate::model::config_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous=h.app.quota.config.clone();
+        if fail_config{
+            std::fs::create_dir(dir.join("ai-quota.json")).unwrap();
+        }else{
+            previous.save_checked().unwrap();
+            std::fs::write(dir.join("credentials"),b"fixture").unwrap();
+        }
+        h.app.settings_open=true;
+        h.app.quota.connect_open=true;
+        let (connect,send)=crate::quota::gemini::Connect::pending();
+        h.app.quota.gemini_connecting=Some(connect);
+        send.send(Ok(crate::quota::gemini::simulated_connected())).unwrap();
+        h.app.quota_tick();
+        assert_eq!(h.app.quota.config,previous);
+        assert_eq!(crate::quota::Config::load(),previous);
+        assert!(!dir.join("credentials").is_dir());
+        assert!(h.app.quota.rows.is_empty());
+        assert!(!h.app.pending.contains(&crate::app::Cmd::QuotaConnected));
     }
 }
 
@@ -3169,7 +3201,7 @@ fn quota_update_status_is_visible_for_every_provider_and_keeps_failed_data(){
         h.hover(H::local(300.0,60.0),1.0);
         assert_eq!(h.app.expanded_height(),176.0,"{provider:?} 额度页应采用同宽加高的布局");
         assert!((h.app.current_width()-PW).abs()<0.1,"{provider:?} 额度页应保持原有宽度：{}",h.app.current_width());
-        let expected=if provider==Provider::Claude{format!("本地记录 · {time}")}else if provider==Provider::DeepSeek{format!("CNY · {time} 更新")}else{format!("{time} 更新")};
+        let expected=match provider{Provider::Antigravity=>format!("agy 上次记录 · {time}"),Provider::Claude=>format!("本地记录 · {time}"),Provider::DeepSeek=>format!("CNY · {time} 更新"),_=>format!("{time} 更新")};
         let status=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)if t.galley.text()==expected=>Some(t.visual_bounding_rect()),_=>None}).unwrap_or_else(||panic!("{provider:?} 缺少更新时间：{expected}"));
         assert!(status.bottom()+6.0<=H::local(0.0,h.app.expanded_height()-9.2).y,"{provider:?} 更新时间 {status:?} 应与分页圆点留出间距");
         for shape in &h.shapes{if let egui::Shape::Text(text)=&shape.shape{
@@ -3179,7 +3211,16 @@ fn quota_update_status_is_visible_for_every_provider_and_keeps_failed_data(){
             }
         }}
         h.app.quota.busy.insert("preview-0".into());h.frame(vec![]);
-        assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains(&time)&&t.galley.text().contains(if provider==Provider::Claude{"读取中"}else{"正在更新"}))),"刷新中仍须保留已有记录时间");
+        let refreshing = match provider { Provider::Antigravity => "agy 上次记录", Provider::Claude => "读取中", _ => "正在更新" };
+        assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains(&time)&&t.galley.text().contains(refreshing))),"刷新中仍须保留已有记录时间");
+        if provider == Provider::Antigravity {
+            // CLI 当前账号可能已切换或退出，无效记录不能让上一账号的额度继续留在卡片上。
+            h.app.quota_event(Event{id:"preview-0".into(),result:Err("等待 agy 上报".into())});h.frame(vec![]);
+            assert!(h.app.quota.rows["preview-0"].is_err());
+            assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()=="等待 agy 上报")));
+            assert!(!h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()=="72%" || t.galley.text()=="44%")));
+            continue;
+        }
         h.app.quota_event(Event{id:"preview-0".into(),result:Err("连接超时".into())});h.frame(vec![]);
         assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()==format!("上次记录 · {time}"))),"{provider:?} 刷新失败后应明确旧数据时间");
         assert_eq!(h.app.quota.rows["preview-0"].as_ref().unwrap().at,at,"刷新失败不能刷新记录时间");
@@ -9095,4 +9136,65 @@ fn every_module_settings_tab_maps_to_its_page(){
 /// 设置页的 AI 额度账号默认收起成一行；需要检查明细的测试先把所有账号展开。
 pub(crate) fn open_quota_details(h:&H){
     for account in &h.app.quota.config.accounts {h.ctx.data_mut(|d|d.insert_temp(egui::Id::new(("quota-account-open",account.id.clone())),true));}
+}
+
+/// 从设置页的新增与重连按钮进入 CLI 表单，全程只渲染界面，不启动 agy。
+#[test]
+fn antigravity_add_and_reconnect_open_the_cli_form() {
+    use crate::quota::{Account, Provider};
+
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for reconnect in [false, true] {
+        let mut h = H::new();
+        h.app.settings_open = true;
+        let trigger = if reconnect {
+            h.app.quota.config.accounts.push(Account {
+                id: "fixture-agy".into(), provider: Provider::Antigravity, alias: "测试 CLI".into(),
+                source: Default::default(), slot: None, enabled: true, pinned: false,
+            });
+            open_quota_details(&h);
+            "重新连接"
+        } else {
+            h.app.quota.provider = Provider::Antigravity;
+            "＋ 添加账号"
+        };
+        let mut draw = |events| {
+            h.t += 0.2;
+            let input = egui::RawInput {
+                time: Some(h.t), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(720.0, 800.0))),
+                events, ..Default::default()
+            };
+            h.ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| h.app.quota_settings(ui));
+            })
+        };
+        // 首帧测量面板尺寸，次帧取得可点击的控件位置。
+        draw(vec![]);
+        let panel = draw(vec![]);
+        if reconnect {
+            assert!(panel.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "打开 agy")));
+            assert!(panel.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text().contains("等待 agy 上报"))));
+        }
+        let point = panel.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Text(text) if text.galley.text() == trigger => Some(text.visual_bounding_rect().center()),
+            _ => None,
+        }).expect("设置页应显示账号操作按钮");
+        for pressed in [true, false] {
+            draw(vec![egui::Event::PointerMoved(point), egui::Event::PointerButton {
+                pos: point, button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+            }]);
+        }
+        draw(vec![]);
+        let dialog = draw(vec![]);
+        let labels: Vec<_> = dialog.shapes.iter().filter_map(|s| match &s.shape {
+            egui::Shape::Text(text) => Some(text.galley.text()),
+            _ => None,
+        }).collect();
+        assert!(labels.contains(&if reconnect { "重新连接账号" } else { "添加账号" }));
+        assert!(labels.contains(&"启用额度同步"));
+        assert!(labels.contains(&"打开 agy"));
+        assert!(labels.iter().any(|s| s.contains("/usage")));
+        assert!(!labels.contains(&"连接已登录的 Chrome"));
+        assert_eq!(h.app.quota.connect_target.as_deref(), reconnect.then_some("fixture-agy"));
+    }
 }
